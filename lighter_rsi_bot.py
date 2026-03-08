@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import math
-import os
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -28,7 +27,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-BOT_TOKEN = os.environ.get("TG_TOKEN", "")
+BOT_TOKEN = "8607839678:AAH5qqejvm-ML7YIE1oZuQhnIhBF1OucsoU"
 CHAT_ID = "5583279698"
 
 LIGHTER_URL = "https://mainnet.zklighter.elliot.ai/api/v1/candles"
@@ -39,7 +38,7 @@ RSI_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]
 EMA_TIMEFRAMES = ["4h"]
 MACD_TIMEFRAMES = ["1h", "4h"]
 BOLLINGER_TIMEFRAMES = ["1h", "4h"]
-DIVERGENCE_TIMEFRAMES = ["15m", "1h", "4h"]
+DIVERGENCE_TIMEFRAMES = ["1h", "4h"]
 VOLUME_TIMEFRAMES = ["5m", "15m", "1h"]
 VOLUME_SPIKE_MULT = 2.0   # volume > 2x average = spike
 
@@ -61,7 +60,7 @@ RSI_OVERBOUGHT = 70
 
 POLL_INTERVAL = 30        # seconds between polling cycles
 
-RSI_TRIGGER_PERIOD = 7    # scalping period for 5m/1m crossback triggers
+RSI_TRIGGER_PERIOD = 14   # standard RSI period across all timeframes
 
 # Signal system
 SIGNAL_COOLDOWN = 900     # 15 min between alerts in same direction
@@ -326,7 +325,7 @@ def generate_alerts():
         rsi_5m = compute_rsi([c["close"] for c in candles_5m], RSI_TRIGGER_PERIOD)
 
     # ── 4. Crossback detection on 5M and 1M ────────────────────────────
-    for tf in ["5m", "1m"]:
+    for tf in ["5m"]:
         candles = candle_cache.get(tf)
         if not candles or len(candles) < 16:
             continue
@@ -352,13 +351,8 @@ def generate_alerts():
         if not crossback_dir:
             continue
 
-        # Trend filter
-        if trend_bias == "bullish" and crossback_dir == "short":
-            log.info(f"Crossback {crossback_dir} on {tf} suppressed (bullish trend)")
-            continue
-        if trend_bias == "bearish" and crossback_dir == "long":
-            log.info(f"Crossback {crossback_dir} on {tf} suppressed (bearish trend)")
-            continue
+        # Trend filter removed — confluence C1 already handles this as a soft factor
+        # Counter-trend reversals (long in bearish, short in bullish) are valid Grade B setups
 
         # Cooldown
         now = time.time()
@@ -833,7 +827,7 @@ async def post_init(app):
         log.info(f"  {tf}: {len(c)} candles" if c else f"  {tf}: no data")
 
     # Initialize prev_rsi for trigger TFs (no crossback alerts on first poll)
-    for tf in ["5m", "1m"]:
+    for tf in ["5m"]:
         candles = candle_cache.get(tf)
         if candles and len(candles) >= 16:
             rsi = compute_rsi([c["close"] for c in candles], RSI_TRIGGER_PERIOD)
