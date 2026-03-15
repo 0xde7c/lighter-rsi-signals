@@ -5,6 +5,7 @@ Read-only (no orders). Pulls candles directly from Lighter's REST API.
 """
 
 import asyncio
+import os
 import json
 import logging
 import math
@@ -18,8 +19,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # --- Config -------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+BOT_TOKEN = os.environ.get("TG_TOKEN", "")
+CHAT_ID = os.environ.get("TG_CHAT", "")
 
 LIGHTER_URL = "https://mainnet.zklighter.elliot.ai/api/v1/candles"
 
@@ -388,7 +389,10 @@ def generate_staged_alerts():
                 f"${price:,.2f}",
             ]
             lines.extend(bonuses)
-            msg = "\n".join(lines)
+            if grade != "C":
+                msg = "\n".join(lines)
+            else:
+                log.info(f"Suppressed Grade C: {asset} OVERSOLD 15M={rsi_15m:.1f}")
 
         # Stage 3: 5M confirms (was oversold, now turning up)
         elif state == "triggered_long" and rsi_5m is not None and prev_5m is not None:
@@ -402,7 +406,10 @@ def generate_staged_alerts():
                     f"15M RSI: {rsi_15m:.1f} | ${price:,.2f}",
                 ]
                 lines.extend(bonuses)
-                msg = "\n".join(lines)
+                if grade != "C":
+                    msg = "\n".join(lines)
+                else:
+                    log.info(f"Suppressed Grade C: {asset} LONG CONFIRMED 5M={rsi_5m:.1f}")
 
         # === SHORT SIDE ===
 
@@ -425,7 +432,10 @@ def generate_staged_alerts():
                 f"${price:,.2f}",
             ]
             lines.extend(bonuses)
-            msg = "\n".join(lines)
+            if grade != "C":
+                msg = "\n".join(lines)
+            else:
+                log.info(f"Suppressed Grade C: {asset} OVERBOUGHT 15M={rsi_15m:.1f}")
 
         # Stage 3: 5M confirms (was overbought, now turning down)
         elif state == "triggered_short" and rsi_5m is not None and prev_5m is not None:
@@ -439,7 +449,10 @@ def generate_staged_alerts():
                     f"15M RSI: {rsi_15m:.1f} | ${price:,.2f}",
                 ]
                 lines.extend(bonuses)
-                msg = "\n".join(lines)
+                if grade != "C":
+                    msg = "\n".join(lines)
+                else:
+                    log.info(f"Suppressed Grade C: {asset} SHORT CONFIRMED 5M={rsi_5m:.1f}")
 
         if new_state != state:
             staged_state[asset] = new_state
