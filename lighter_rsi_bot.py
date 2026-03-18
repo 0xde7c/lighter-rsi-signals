@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-LighterRSI Signal Bot — Staged RSI alerts for ETH/BTC/SOL on Lighter DEX.
+LighterRSI Signal Bot v2.4 — Trend-Aware Staged RSI alerts for ETH/BTC/SOL on Lighter DEX.
 Read-only (no orders). Pulls candles directly from Lighter's REST API.
+
+v2 additions:
+  - Trend state engine (5 states from 4H EMA + 1H RSI)
+  - Adaptive RSI thresholds per trend state
+  - RSI velocity filter (15+ pts in 3 candles)
+  - Momentum persistence filter (10+ candles one-sided)
+  - Signal classification (WITH-TREND / COUNTER-TREND / NEUTRAL)
+  - Counter-trend signals require Grade A minimum
+
+v2.1 additions:
+  - Funding rate as confluence factor (Binance perpetual funding rate)
+  - SOL-specific wider RSI thresholds (+5 pts)
+  - Cardwell divergence reclassification (bearish div in strong uptrend = continuation)
 """
 
 import asyncio
-import os
 import json
 import logging
 import math
 import time
 import urllib.request
+from collections import deque
 from datetime import datetime, timezone
 from functools import partial
 
@@ -19,8 +32,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # --- Config -------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("TG_TOKEN", "")
-CHAT_ID = os.environ.get("TG_CHAT", "")
+BOT_TOKEN = "YOUR_TG_BOT_TOKEN"
+CHAT_ID = "YOUR_TG_CHAT_ID"
 
 LIGHTER_URL = "https://mainnet.zklighter.elliot.ai/api/v1/candles"
 
@@ -62,6 +75,61 @@ SWING_COOLDOWN = 1800  # 30 min between swing alerts per asset
 
 POLL_INTERVAL = 30
 
+# --- Funding Rate Config -----------------------------------------------------
+
+BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+BINANCE_SYMBOLS = {"ETH": "ETHUSDT", "BTC": "BTCUSDT", "SOL": "SOLUSDT"}
+FUNDING_CACHE_TTL = 300  # refresh every 5 min (rate updates every 8h but we want freshness)
+FUNDING_EXTREME_THRESHOLD = 0.0005  # 0.05% = extreme funding (annualized ~18%)
+FUNDING_CONFLUENCE_THRESHOLD = 0.0003  # 0.03% = mild confluence signal
+
+# --- Binance Volume Context Config --------------------------------------------
+
+BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+VOLUME_CACHE_TTL = 60  # refresh every 60s (5m candles update frequently)
+# Median 5m volumes from research (USD quote volume, Binance Futures, Mar 2026)
+VOLUME_MEDIANS = {
+    "BTC": 27_700_000,  # $27.7M
+    "ETH": 23_400_000,  # $23.4M
+    "SOL":  4_400_000,  # $4.4M
+}
+VOLUME_WARNING_MULT = 5    # 5x median = warning line on signals
+VOLUME_HEAVY_MULT = 8      # 8x median = "HEAVY" label
+VOLUME_EXTREME_MULT = 10   # 10x median = "EXTREME" label
+
+# --- Trend-Aware Config -------------------------------------------------------
+
+# Adaptive RSI thresholds per trend state: (long_entry, short_entry)
+# Tighter thresholds — only deep extremes trigger. No side fully suppressed.
+TREND_THRESHOLDS = {
+    "STRONG_UPTREND":   {"long": 33, "short": 78},
+    "MILD_UPTREND":     {"long": 30, "short": 75},
+    "NEUTRAL":          {"long": 28, "short": 72},
+    "MILD_DOWNTREND":   {"long": 25, "short": 68},
+    "STRONG_DOWNTREND": {"long": 22, "short": 65},
+}
+
+# Per-asset threshold offsets: widen RSI bands for more volatile assets
+# Positive = wider bands (long threshold lower, short threshold higher)
+ASSET_THRESHOLD_OFFSET = {
+    "ETH": 0,
+    "BTC": 0,
+    "SOL": 5,  # SOL is ~2x ETH vol, needs wider bands to avoid noise
+}
+
+# EMA proximity threshold for NEUTRAL classification
+EMA_NEUTRAL_PCT = 0.005  # 0.5%
+
+# RSI velocity: minimum points moved in 3 candles to fire alert
+RSI_VELOCITY_MIN = 6
+
+# Deep extreme: skip velocity check and allow Grade C at these levels
+RSI_DEEP_EXTREME_LOW = 25   # RSI below this = fire regardless of velocity/grade
+RSI_DEEP_EXTREME_HIGH = 78  # RSI above this = fire regardless of velocity/grade
+
+# Momentum persistence: consecutive candles above 60 or below 40
+MOMENTUM_PERSISTENCE_THRESHOLD = 10
+
 # --- State --------------------------------------------------------------------
 
 candle_cache = {}        # (asset, tf) -> [candle_dicts]
@@ -72,17 +140,90 @@ last_fetch = {}          # (asset, tf) -> timestamp
 staged_state = {}        # asset -> "neutral"/"approach_long"/"approach_short"/"triggered_long"/"triggered_short"
 staged_5m_prev = {}      # asset -> previous 5M RSI value
 
-# Standalone 5m RSI alerts (ETH only)
-eth_5m_rsi_state = "neutral"     # "neutral" / "oversold" / "overbought"
-eth_5m_rsi_last_alert = 0.0      # timestamp of last 5m RSI alert
-ETH_5M_RSI_COOLDOWN = 300        # 5 min cooldown between 5m RSI alerts
-ETH_5M_RSI_OB = 70               # overbought threshold
-ETH_5M_RSI_OS = 30               # oversold threshold
+# Standalone 5m RSI alerts (all assets now, not just ETH)
+rsi_5m_state = {}        # asset -> "neutral" / "oversold" / "overbought"
+rsi_5m_last_alert = {}   # asset -> timestamp
+RSI_5M_COOLDOWN = 300    # 5 min cooldown between 5m RSI alerts
 
 # Swing state
 last_swing_alert = {}    # asset -> timestamp
 
 user_selected_asset = {} # chat_id -> "BTC"/"ETH"/"SOL"
+
+# Trend state
+trend_state = {}         # asset -> "STRONG_UPTREND"/"MILD_UPTREND"/"NEUTRAL"/"MILD_DOWNTREND"/"STRONG_DOWNTREND"
+
+# RSI history for velocity calculation
+rsi_history = {}         # (asset, tf) -> deque(maxlen=5) of RSI values
+
+# Momentum persistence counters
+momentum_above = {}      # asset -> count of consecutive 5M candles with RSI > 60
+momentum_below = {}      # asset -> count of consecutive 5M candles with RSI < 40
+momentum_warned = {}     # asset -> "above"/"below"/None — track if warning was sent
+
+# Funding rate state
+funding_rates = {}           # asset -> {"rate": float, "time": timestamp}
+funding_last_fetch = 0       # timestamp of last Binance API call
+binance_volume_cache = {}    # asset -> {"candles": [...], "time": timestamp}
+binance_volume_last_fetch = 0  # timestamp of last Binance volume API call
+
+# Context alert state
+context_cooldowns = {}       # (alert_type, asset) -> last_fire_timestamp
+context_flags = {}           # (alert_type, asset) -> condition key for dedup/reset
+pending_trend_changes = []   # [(asset, old_state, new_state)] — drained by context alerts
+
+# Trend debounce — require N consecutive checks before confirming state change
+trend_debounce_pending = {}   # asset -> {"state": new_state, "count": int}
+# v2.3: Active signal tracking for exit/hold alerts
+active_signals = {}       # asset -> {"direction", "entry_time", "entry_price", "entry_rsi_5m/15m/30m", "time_warned_5/15"}
+
+# v2.3: RSI direction tracking for 15m and 30m
+rsi_history_15m = {}      # asset -> deque(maxlen=8) of RSI values
+rsi_history_30m = {}      # asset -> deque(maxlen=8) of RSI values
+
+# v2.3: Exit signal cooldowns
+exit_alert_cooldowns = {} # (alert_type, asset) -> last_fire_timestamp
+
+# v2.3: Repeated signal tracking
+signal_history = {}       # asset -> deque of {"direction": str, "time": float, "grade": str}
+
+TREND_DEBOUNCE_CHECKS = 3    # require 3 consecutive checks (~90s at 30s poll)
+
+# v2.4: Market regime detection (fast overlay on slow trend engine)
+market_regime = {}           # asset -> "WATERFALL_DOWN"|"WATERFALL_UP"|"NORMAL"
+regime_debounce = {}         # asset -> {"regime": str, "count": int}
+pending_regime_changes = []  # [(asset, old, new)] for context alerts
+bounce_state = {}            # asset -> "idle"|"watching"|"ready"
+bounce_rsi_low = {}          # asset -> lowest 5M RSI seen in current waterfall
+REGIME_DEBOUNCE_CHECKS = 2  # fast — regime must react quickly
+WATERFALL_1H_RSI_DOWN = 35  # 1H RSI below this = potential waterfall down
+WATERFALL_1H_RSI_UP = 65    # 1H RSI above this = potential waterfall up
+WATERFALL_15M_CEILING = 50  # if 15M RSI max stays below this = confirmed waterfall
+WATERFALL_ROC_PCT = 2.5     # 6-hour price rate of change threshold (%)
+BOUNCE_FADE_ENTRY = 40      # 5M RSI level where bounce-fade short can fire
+BOUNCE_FADE_TURN = 2        # 5M RSI must drop this many pts to confirm turn
+# --- v2.3: Multi-TF Exit/Hold Config -----------------------------------------
+EXIT_SIGNAL_COOLDOWN = 120          # 2 min between same-type exit alerts per asset
+EXIT_SIGNAL_EXPIRY = 1200           # 20 min: active signals expire
+EXIT_RSI_NEUTRAL_LOW = 40           # 5m RSI in 40-60 = signal expired
+EXIT_RSI_NEUTRAL_HIGH = 60
+EXIT_30M_NEUTRAL_LOW = 45           # 30m RSI 45-55 = exhaustion zone
+EXIT_30M_NEUTRAL_HIGH = 55
+EXIT_15M_TURN_THRESHOLD = 2         # 15m must move 2+ consecutive polls to count as "turning"
+TIME_WARNING_1 = 300                # 5 min warning
+TIME_WARNING_2 = 900                # 15 min warning
+
+# Repeated signal escalation
+REPEAT_SIGNAL_WINDOW = 1800         # 30 min window for counting same-direction signals
+
+
+# Context alert config
+CONTEXT_COOLDOWN_DEFAULT = 3600       # 1 hour
+CONTEXT_COOLDOWN_EXHAUSTION = 21600  # 6 hours
+CONTEXT_APPROACH_BUFFER = 3         # RSI points from threshold to start warning
+CONTEXT_EMA_PROXIMITY_PCT = 0.01     # 1% from EMA50
+CONTEXT_BB_SQUEEZE_ENTER = 2.0       # 2% bandwidth = squeeze
+CONTEXT_BB_SQUEEZE_EXIT = 3.0        # 3% bandwidth = squeeze over
 
 # --- Logging ------------------------------------------------------------------
 
@@ -258,16 +399,608 @@ def _get_price(asset):
     return None
 
 
-def _get_4h_trend(asset):
-    """Helper: 4H trend label from RSI."""
-    rsi = _get_rsi(asset, "4h")
-    if rsi is None:
-        return "N/A"
-    if rsi > 55:
-        return "Bullish"
-    if rsi < 45:
-        return "Bearish"
-    return "Neutral"
+def _get_4h_ema50(asset):
+    """Helper: get 4H EMA(50) value."""
+    candles = candle_cache.get((asset, "4h"))
+    if not candles or len(candles) < 50:
+        return None
+    closes = [c["close"] for c in candles]
+    ema = compute_ema(closes, 50)
+    return ema[-1] if ema else None
+
+
+# ==============================================================================
+# FUNDING RATE FETCHER (Binance perpetual)
+# ==============================================================================
+
+def fetch_funding_rates():
+    """Fetch latest funding rates from Binance for all assets. Cached for FUNDING_CACHE_TTL."""
+    global funding_last_fetch
+    now = time.time()
+    if now - funding_last_fetch < FUNDING_CACHE_TTL:
+        return
+
+    for asset, symbol in BINANCE_SYMBOLS.items():
+        try:
+            url = f"{BINANCE_FUNDING_URL}?symbol={symbol}&limit=1"
+            resp = json.loads(urllib.request.urlopen(url, timeout=10).read().decode())
+            if resp and len(resp) > 0:
+                rate = float(resp[0]["fundingRate"])
+                funding_rates[asset] = {"rate": rate, "time": now}
+                log.info(f"Funding rate {asset}: {rate:+.6f} ({rate*100:+.4f}%)")
+        except Exception as e:
+            log.warning(f"Funding rate fetch failed for {asset}: {e}")
+
+    funding_last_fetch = now
+
+
+def get_funding_rate(asset):
+    """Get cached funding rate for asset. Returns float or None."""
+    data = funding_rates.get(asset)
+    if data and time.time() - data["time"] < FUNDING_CACHE_TTL * 3:  # stale after 3x TTL
+        return data["rate"]
+    return None
+
+
+def get_funding_signal(asset):
+    """Interpret funding rate as a directional signal.
+    Returns ("long"/"short"/None, description_string).
+    High positive funding = longs paying shorts = short confluence.
+    High negative funding = shorts paying longs = long confluence.
+    """
+    rate = get_funding_rate(asset)
+    if rate is None:
+        return None, ""
+
+    if rate >= FUNDING_EXTREME_THRESHOLD:
+        return "short", f"Funding: {rate*100:+.4f}% (longs paying — short bias)"
+    elif rate <= -FUNDING_EXTREME_THRESHOLD:
+        return "long", f"Funding: {rate*100:+.4f}% (shorts paying — long bias)"
+    elif rate >= FUNDING_CONFLUENCE_THRESHOLD:
+        return "short", f"Funding: {rate*100:+.4f}% (mild short bias)"
+    elif rate <= -FUNDING_CONFLUENCE_THRESHOLD:
+        return "long", f"Funding: {rate*100:+.4f}% (mild long bias)"
+    return None, ""
+
+
+# ==============================================================================
+# TREND STATE ENGINE (Feature 1)
+# ==============================================================================
+
+def get_trend_state(asset):
+    """Classify asset into 5 trend states using 4H EMA(50) and 1H RSI.
+    Structure (EMA) and momentum (RSI) must agree. If they conflict = NEUTRAL."""
+    price = _get_price(asset)
+    ema_4h = _get_4h_ema50(asset)
+    rsi_1h = _get_rsi(asset, "1h")
+
+    if price is None or ema_4h is None:
+        return "NEUTRAL"
+
+    # Check if price is within 0.5% of EMA — neutral zone
+    if abs(price - ema_4h) / ema_4h < EMA_NEUTRAL_PCT:
+        return "NEUTRAL"
+
+    if price > ema_4h:
+        # Structure bullish — check if momentum agrees
+        if rsi_1h is not None and rsi_1h > 60:
+            return "STRONG_UPTREND"
+        elif rsi_1h is not None and 40 <= rsi_1h <= 60:
+            return "MILD_UPTREND"
+        elif rsi_1h is not None and rsi_1h < 40:
+            return "NEUTRAL"  # structure up but momentum bearish = conflicting
+        else:
+            return "MILD_UPTREND"
+    else:
+        # Structure bearish — check if momentum agrees
+        if rsi_1h is not None and rsi_1h < 40:
+            return "STRONG_DOWNTREND"
+        elif rsi_1h is not None and 40 <= rsi_1h <= 60:
+            return "MILD_DOWNTREND"
+        elif rsi_1h is not None and rsi_1h > 60:
+            return "NEUTRAL"  # structure down but momentum bullish = conflicting
+        else:
+            return "MILD_DOWNTREND"
+
+
+def update_all_trend_states():
+    """Update trend state for all assets. Called every cycle. Debounced."""
+    for asset in ASSET_NAMES:
+        old = trend_state.get(asset)
+        new = get_trend_state(asset)
+
+        if old and old != new:
+            # Debounce: require new state to persist for N checks
+            pending = trend_debounce_pending.get(asset)
+            if pending and pending["state"] == new:
+                pending["count"] += 1
+                if pending["count"] >= TREND_DEBOUNCE_CHECKS:
+                    trend_state[asset] = new
+                    del trend_debounce_pending[asset]
+                    log.info(f"Trend change (confirmed): {asset} {old} -> {new}")
+                    pending_trend_changes.append((asset, old, new))
+            else:
+                trend_debounce_pending[asset] = {"state": new, "count": 1}
+        else:
+            trend_state[asset] = new
+            if asset in trend_debounce_pending:
+                del trend_debounce_pending[asset]
+
+
+def detect_market_regime(asset):
+    """Fast regime detection: WATERFALL_DOWN, WATERFALL_UP, or NORMAL.
+    Uses 1H RSI + 15M RSI history + 6h price rate of change.
+    Much faster than the 4H EMA trend engine — catches waterfalls within 1-2 cycles."""
+    rsi_1h = _get_rsi(asset, "1h")
+    if rsi_1h is None:
+        return "NORMAL"
+
+    # Check 1: 1H RSI at extreme
+    is_1h_bearish = rsi_1h < WATERFALL_1H_RSI_DOWN
+    is_1h_bullish = rsi_1h > WATERFALL_1H_RSI_UP
+
+    if not is_1h_bearish and not is_1h_bullish:
+        return "NORMAL"
+
+    # Check 2: 15M RSI ceiling/floor — confirms sustained trend
+    hist_15m = rsi_history_15m.get(asset)
+    confirm_15m = False
+    if hist_15m and len(hist_15m) >= 4:
+        recent_4 = list(hist_15m)[-4:]
+        if is_1h_bearish and max(recent_4) < WATERFALL_15M_CEILING:
+            confirm_15m = True
+        elif is_1h_bullish and min(recent_4) > (100 - WATERFALL_15M_CEILING):
+            confirm_15m = True
+
+    # Check 3: Price rate of change over last 6 1H candles
+    confirm_roc = False
+    candles_1h = candle_cache.get((asset, "1h"))
+    if candles_1h and len(candles_1h) >= 7:
+        close_now = candles_1h[-1]["close"]
+        close_6h = candles_1h[-7]["close"]
+        roc_pct = (close_now - close_6h) / close_6h * 100
+        if is_1h_bearish and roc_pct < -WATERFALL_ROC_PCT:
+            confirm_roc = True
+        elif is_1h_bullish and roc_pct > WATERFALL_ROC_PCT:
+            confirm_roc = True
+
+    # Need 1H extreme + at least one confirmation
+    if is_1h_bearish and (confirm_15m or confirm_roc):
+        return "WATERFALL_DOWN"
+    if is_1h_bullish and (confirm_15m or confirm_roc):
+        return "WATERFALL_UP"
+
+    return "NORMAL"
+
+
+def update_all_regimes():
+    """Update market regime for all assets. Called every cycle. Debounced (2 checks)."""
+    for asset in ASSET_NAMES:
+        old = market_regime.get(asset, "NORMAL")
+        new = detect_market_regime(asset)
+
+        if old != new:
+            pending = regime_debounce.get(asset)
+            if pending and pending["regime"] == new:
+                pending["count"] += 1
+                if pending["count"] >= REGIME_DEBOUNCE_CHECKS:
+                    market_regime[asset] = new
+                    if asset in regime_debounce:
+                        del regime_debounce[asset]
+                    log.info(f"Regime change (confirmed): {asset} {old} -> {new}")
+                    pending_regime_changes.append((asset, old, new))
+                    # Reset bounce state on regime change
+                    bounce_state[asset] = "idle"
+                    bounce_rsi_low[asset] = 100
+            else:
+                regime_debounce[asset] = {"regime": new, "count": 1}
+        else:
+            market_regime[asset] = new
+            if asset in regime_debounce:
+                del regime_debounce[asset]
+
+
+def get_regime_str(asset):
+    """Short regime string for signal messages."""
+    regime = market_regime.get(asset, "NORMAL")
+    if regime == "WATERFALL_DOWN":
+        return "\u26a0\ufe0f WATERFALL"
+    elif regime == "WATERFALL_UP":
+        return "\u26a0\ufe0f MELT-UP"
+    return ""
+
+
+def get_trend_label(state):
+    """Human-readable trend label."""
+    labels = {
+        "STRONG_UPTREND": "Strong Uptrend",
+        "MILD_UPTREND": "Mild Uptrend",
+        "NEUTRAL": "Neutral",
+        "MILD_DOWNTREND": "Mild Downtrend",
+        "STRONG_DOWNTREND": "Strong Downtrend",
+    }
+    return labels.get(state, state)
+
+
+# ==============================================================================
+# ADAPTIVE RSI THRESHOLDS (Feature 2)
+# ==============================================================================
+
+def get_rsi_thresholds(asset):
+    """Return (long_entry, short_entry) based on current trend state.
+    None = suppressed (don't fire signals for that side).
+    Applies per-asset offset (e.g. SOL +5 = wider bands).
+    """
+    state = trend_state.get(asset, "NEUTRAL")
+    cfg = TREND_THRESHOLDS.get(state, TREND_THRESHOLDS["NEUTRAL"])
+    offset = ASSET_THRESHOLD_OFFSET.get(asset, 0)
+    long_t = cfg["long"]
+    short_t = cfg["short"]
+    if offset and long_t is not None:
+        long_t = long_t - offset  # lower = harder to trigger long
+    if offset and short_t is not None:
+        short_t = short_t + offset  # higher = harder to trigger short
+    return long_t, short_t
+
+
+def get_15m_thresholds(asset):
+    """15M thresholds are 5 points more extreme than 5M ones.
+    For longs: 15M threshold = 5M threshold + 5 (higher = more extreme oversold approach)
+    For shorts: 15M threshold = 5M threshold - 5 (lower = more extreme overbought approach)
+    """
+    long_5m, short_5m = get_rsi_thresholds(asset)
+    long_15m = (long_5m + 5) if long_5m is not None else None
+    short_15m = (short_5m - 5) if short_5m is not None else None
+    return long_15m, short_15m
+
+
+# ==============================================================================
+# RSI VELOCITY FILTER (Feature 3)
+# ==============================================================================
+
+def update_rsi_history(asset, tf, rsi_val):
+    """Store RSI reading in history buffer."""
+    if rsi_val is None:
+        return
+    key = (asset, tf)
+    if key not in rsi_history:
+        rsi_history[key] = deque(maxlen=5)
+    rsi_history[key].append(rsi_val)
+
+
+def get_rsi_velocity(asset, tf):
+    """Calculate RSI movement over last 3 readings.
+    Returns (velocity_pts, direction_str) or (0, "").
+    """
+    key = (asset, tf)
+    hist = rsi_history.get(key)
+    if not hist or len(hist) < 4:
+        return 0, ""
+    # Movement from 3 readings ago to current
+    oldest = hist[-4]  # 3 candles back
+    newest = hist[-1]
+    velocity = newest - oldest
+    direction = "\u2191" if velocity > 0 else "\u2193"
+    return abs(velocity), f"{direction}{abs(velocity):.0f}pts in 3 candles"
+
+
+
+
+# ==============================================================================
+# v2.3: RSI DIRECTION TRACKING FOR 15M/30M
+# ==============================================================================
+
+def update_rsi_direction_history(asset, tf):
+    """Store RSI reading for 15m or 30m direction tracking."""
+    rsi_val = _get_rsi(asset, tf)
+    if rsi_val is None:
+        return
+    if tf == "15m":
+        if asset not in rsi_history_15m:
+            rsi_history_15m[asset] = deque(maxlen=8)
+        rsi_history_15m[asset].append(rsi_val)
+    elif tf == "30m":
+        if asset not in rsi_history_30m:
+            rsi_history_30m[asset] = deque(maxlen=8)
+        rsi_history_30m[asset].append(rsi_val)
+
+
+def get_rsi_direction(asset, tf):
+    """Return (direction_str, delta_pts) for 15m or 30m RSI.
+    direction_str: 'up' / 'down' / 'flat'
+    delta_pts: absolute change from previous reading
+    """
+    hist = rsi_history_15m.get(asset) if tf == "15m" else rsi_history_30m.get(asset)
+    if not hist or len(hist) < 2:
+        return "flat", 0.0
+    delta = hist[-1] - hist[-2]
+    if abs(delta) < 1.0:
+        return "flat", abs(delta)
+    return ("up" if delta > 0 else "down"), abs(delta)
+
+
+def is_rsi_aligned(direction, rsi_dir):
+    """Check if RSI direction supports the trade direction."""
+    if direction == "long":
+        return rsi_dir == "up"
+    elif direction == "short":
+        return rsi_dir == "down"
+    return False
+
+
+def _15m_consecutive_against(asset, trade_direction):
+    """Count consecutive 15m RSI readings moving against the trade direction."""
+    hist = rsi_history_15m.get(asset)
+    if not hist or len(hist) < 2:
+        return 0
+    count = 0
+    for i in range(len(hist) - 1, 0, -1):
+        delta = hist[i] - hist[i-1]
+        if trade_direction == "long" and delta < -0.5:
+            count += 1
+        elif trade_direction == "short" and delta > 0.5:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _build_tf_context(asset, direction):
+    """Build simple confluence summary for entry signals.
+    Returns (confluence_str, aligned_count, total_count).
+    v2.4: During waterfall, all-oversold = trend strength, labeled accordingly."""
+    aligned = 0
+    total = 0
+    regime = market_regime.get(asset, "NORMAL")
+
+    for tf in ["15m", "30m", "1h"]:
+        rsi = _get_rsi(asset, tf)
+        if rsi is None:
+            continue
+        total += 1
+        if direction == "long" and rsi < 40:
+            aligned += 1
+        elif direction == "short" and rsi > 60:
+            aligned += 1
+
+    # During waterfall, all-aligned for longs/shorts means trend strength
+    tag = ""
+    if regime == "WATERFALL_DOWN" and direction == "long" and aligned == total and total > 0:
+        tag = " (trend)"
+    elif regime == "WATERFALL_UP" and direction == "short" and aligned == total and total > 0:
+        tag = " (trend)"
+    return f"{aligned}/{total} TFs{tag}", aligned, total
+
+
+def _get_1d_rsi_str(asset):
+    """Get 1D RSI as label + direction arrow for signal context."""
+    rsi_1d = _get_rsi(asset, "1d")
+    if rsi_1d is None:
+        return ""
+    # Label
+    if rsi_1d > 70:
+        label = "Overbought"
+    elif rsi_1d >= 60:
+        label = "Bullish"
+    elif rsi_1d >= 45:
+        label = "Neutral"
+    elif rsi_1d >= 30:
+        label = "Bearish"
+    else:
+        label = "Oversold"
+    # Direction from previous value if available
+    hist = rsi_history.get((asset, "1d"))
+    if hist and len(hist) >= 2:
+        delta = hist[-1] - hist[-2]
+        arrow = "\u2191" if delta > 1 else "\u2193" if delta < -1 else ""
+    else:
+        arrow = ""
+    return f"1D: {label}{arrow}"
+
+def fetch_binance_volume():
+    """Fetch last 20 5m candles from Binance Futures for volume analysis. Cached for VOLUME_CACHE_TTL."""
+    global binance_volume_last_fetch
+    now = time.time()
+    if now - binance_volume_last_fetch < VOLUME_CACHE_TTL:
+        return
+
+    for asset, symbol in BINANCE_SYMBOLS.items():
+        try:
+            url = f"{BINANCE_KLINES_URL}?symbol={symbol}&interval=5m&limit=20"
+            resp = json.loads(urllib.request.urlopen(url, timeout=10).read().decode())
+            if resp and len(resp) > 0:
+                candles = []
+                for c in resp:
+                    candles.append({
+                        "vol_usd": float(c[7]),  # quote_volume
+                        "tbr": float(c[10]) / float(c[7]) if float(c[7]) > 0 else 0.5,  # taker buy ratio
+                        "close": float(c[4]),
+                        "open": float(c[1]),
+                    })
+                binance_volume_cache[asset] = {"candles": candles, "time": now}
+        except Exception as e:
+            log.warning(f"Binance volume fetch failed for {asset}: {e}")
+
+    binance_volume_last_fetch = now
+
+
+def _get_vol_context(asset):
+    """Check recent Binance volume for elevated activity.
+    Returns short warning string or empty string. NOT a filter — just context."""
+    data = binance_volume_cache.get(asset)
+    if not data or time.time() - data["time"] > VOLUME_CACHE_TTL * 3:
+        return ""
+
+    candles = data["candles"]
+    if len(candles) < 3:
+        return ""
+
+    median_vol = VOLUME_MEDIANS.get(asset, 10_000_000)
+
+    # Check last 3 candles for spikes
+    recent = candles[-3:]
+    max_vol = max(c["vol_usd"] for c in recent)
+    max_mult = max_vol / median_vol
+
+    if max_mult < VOLUME_WARNING_MULT:
+        return ""
+
+    # Determine direction bias from taker buy ratio
+    avg_tbr = sum(c["tbr"] for c in recent) / len(recent)
+    if avg_tbr < 0.4:
+        bias = "sell-heavy"
+    elif avg_tbr > 0.6:
+        bias = "buy-heavy"
+    else:
+        bias = "mixed"
+
+    return f"\u26a1 Vol {max_mult:.0f}x {bias}"
+
+
+def _get_1h_rsi_trend_str(asset):
+    """Get 1H RSI with direction arrow for signal line 3."""
+    rsi_1h = _get_rsi(asset, "1h")
+    if rsi_1h is None:
+        return ""
+    hist = rsi_history.get((asset, "1h"))
+    if hist and len(hist) >= 2:
+        delta = hist[-1] - hist[-2]
+        arrow = "\u2191" if delta > 1 else "\u2193" if delta < -1 else ""
+    else:
+        arrow = ""
+    return f"1H RSI {rsi_1h:.0f}{arrow}"
+
+
+def _register_active_signal(asset, direction, price, rsi_5m, grade):
+    """Register an active signal for exit/hold tracking."""
+    import time as _time
+    active_signals[asset] = {
+        "direction": direction,
+        "entry_time": _time.time(),
+        "entry_price": price,
+        "entry_rsi_5m": rsi_5m,
+        "entry_rsi_15m": _get_rsi(asset, "15m"),
+        "entry_rsi_30m": _get_rsi(asset, "30m"),
+        "time_warned_5": False,
+        "time_warned_15": False,
+    }
+    if asset not in signal_history:
+        signal_history[asset] = deque(maxlen=10)
+    signal_history[asset].append({
+        "direction": direction,
+        "time": _time.time(),
+        "grade": grade,
+    })
+
+
+def check_repeat_signal(asset, direction, grade):
+    """Check if this is a repeated signal. Returns (should_fire, count, reason)."""
+    import time as _time
+    now = _time.time()
+    hist = signal_history.get(asset)
+    if not hist:
+        return True, 1, ""
+    recent = [s for s in hist if s["direction"] == direction and now - s["time"] < REPEAT_SIGNAL_WINDOW]
+    count = len(recent) + 1
+    if count <= 1:
+        return True, 1, ""
+    elif count == 2:
+        if grade not in ("A", "B"):
+            return False, count, f"2nd {direction} in {REPEAT_SIGNAL_WINDOW//60}min needs A/B"
+        return True, count, ""
+    else:
+        if grade != "A":
+            return False, count, f"{count}th {direction} in {int((now - recent[0]['time'])/60)}min - RSI not holding"
+        return True, count, ""
+
+# ==============================================================================
+# MOMENTUM PERSISTENCE FILTER (Feature 4)
+# ==============================================================================
+
+def update_momentum_persistence(asset):
+    """Track consecutive 5M candles with RSI above 60 or below 40."""
+    rsi_5m = _get_rsi(asset, "5m")
+    if rsi_5m is None:
+        return None
+
+    # Reset through 50
+    if 45 <= rsi_5m <= 55:
+        momentum_above[asset] = 0
+        momentum_below[asset] = 0
+        momentum_warned[asset] = None
+        return None
+
+    if rsi_5m > 60:
+        momentum_above[asset] = momentum_above.get(asset, 0) + 1
+        momentum_below[asset] = 0
+        count = momentum_above[asset]
+        if count >= MOMENTUM_PERSISTENCE_THRESHOLD and momentum_warned.get(asset) != "above":
+            momentum_warned[asset] = "above"
+            log.info(f"Momentum persistence: {asset} RSI>60 for {count} candles (blocking counter-trend shorts)")
+            return None  # suppress TG alert — too noisy, momentum info is in /status
+    elif rsi_5m < 40:
+        momentum_below[asset] = momentum_below.get(asset, 0) + 1
+        momentum_above[asset] = 0
+        count = momentum_below[asset]
+        if count >= MOMENTUM_PERSISTENCE_THRESHOLD and momentum_warned.get(asset) != "below":
+            momentum_warned[asset] = "below"
+            log.info(f"Momentum persistence: {asset} RSI<40 for {count} candles (blocking counter-trend longs)")
+            return None  # suppress TG alert — too noisy, momentum info is in /status
+    else:
+        # RSI between 40-60 but not in reset zone — don't count
+        pass
+
+    return None
+
+
+def is_momentum_blocked(asset, direction):
+    """Momentum persistence — disabled as filter, kept for logging only.
+    User wants no suppression; volume context handles warnings instead."""
+    return False
+
+
+# ==============================================================================
+# SIGNAL CLASSIFICATION (Feature 5)
+# ==============================================================================
+
+def classify_signal(asset, direction):
+    """Classify signal as WITH-TREND, COUNTER-TREND, or NEUTRAL.
+    v2.4: Regime overrides slow trend engine — waterfall down means longs are always CT."""
+    regime = market_regime.get(asset, "NORMAL")
+
+    # Regime overrides: fast detection beats slow EMA trend
+    if regime == "WATERFALL_DOWN" and direction == "long":
+        return "COUNTER-TREND"
+    if regime == "WATERFALL_DOWN" and direction == "short":
+        return "WITH-TREND"
+    if regime == "WATERFALL_UP" and direction == "short":
+        return "COUNTER-TREND"
+    if regime == "WATERFALL_UP" and direction == "long":
+        return "WITH-TREND"
+
+    # Fall back to slow trend engine
+    state = trend_state.get(asset, "NEUTRAL")
+    if state == "NEUTRAL":
+        return "NEUTRAL"
+
+    is_uptrend = state in ("STRONG_UPTREND", "MILD_UPTREND")
+    is_downtrend = state in ("STRONG_DOWNTREND", "MILD_DOWNTREND")
+
+    if direction == "long" and is_uptrend:
+        return "WITH-TREND"
+    if direction == "short" and is_downtrend:
+        return "WITH-TREND"
+    if direction == "long" and is_downtrend:
+        return "COUNTER-TREND"
+    if direction == "short" and is_uptrend:
+        return "COUNTER-TREND"
+    return "NEUTRAL"
+
+
+def should_suppress_signal(classification, grade):
+    """v2.4: No suppression — all signals pass through with warning tags.
+    CT + WATERFALL tags provide context; user decides."""
+    return False
 
 
 # ==============================================================================
@@ -285,7 +1018,7 @@ def get_confluence_bonus(asset, direction):
             volumes = [c["volume"] for c in candles]
             avg = sum(volumes[-21:-1]) / 20
             if avg > 0 and volumes[-1] / avg >= VOLUME_SPIKE_MULT:
-                bonuses.append(f"\U0001f525 Volume spike {tf} ({volumes[-1]/avg:.1f}x)")
+                bonuses.append(f"Volume: {volumes[-1]/avg:.1f}x \u2713")
                 break
 
     # MACD crossover on 1H
@@ -295,9 +1028,9 @@ def get_confluence_bonus(asset, direction):
         _, _, hist = compute_macd(closes)
         if hist and len(hist) >= 2:
             if direction == "long" and hist[-1] > 0 and hist[-2] <= 0:
-                bonuses.append("\u2705 MACD bullish cross 1H")
+                bonuses.append("1H MACD bullish cross \u2713")
             elif direction == "short" and hist[-1] < 0 and hist[-2] >= 0:
-                bonuses.append("\u2705 MACD bearish cross 1H")
+                bonuses.append("1H MACD bearish cross \u2713")
 
     # Bollinger band touch on 1H
     if candles_1h and len(candles_1h) >= 20:
@@ -306,9 +1039,9 @@ def get_confluence_bonus(asset, direction):
         if upper is not None:
             price = closes[-1]
             if direction == "long" and price < lower:
-                bonuses.append("\u2705 Below lower Bollinger 1H")
+                bonuses.append("1H BB: Lower band \u2713")
             elif direction == "short" and price > upper:
-                bonuses.append("\u2705 Above upper Bollinger 1H")
+                bonuses.append("1H BB: Upper band \u2713")
 
     # RSI divergence on 15M
     candles_15m = candle_cache.get((asset, "15m"))
@@ -318,38 +1051,63 @@ def get_confluence_bonus(asset, direction):
         divs = detect_divergence(closes, rsi_series)
         if divs:
             if direction == "long" and divs[-1][0] == "bullish":
-                bonuses.append("\u2705 Bullish RSI divergence 15M")
+                bonuses.append("15M RSI divergence \u2713")
             elif direction == "short" and divs[-1][0] == "bearish":
-                bonuses.append("\u2705 Bearish RSI divergence 15M")
+                bonuses.append("15M RSI divergence \u2713")
+
+    # Funding rate confluence
+    funding_dir, funding_desc = get_funding_signal(asset)
+    if funding_dir == direction and funding_desc:
+        bonuses.append(funding_desc + " \u2713")
 
     return bonuses
 
 
+def compute_grade(bonuses):
+    """Grade from confluence count."""
+    n = len(bonuses)
+    if n >= 2:
+        return "A"
+    if n == 1:
+        return "B"
+    return "C"
+
+
 # ==============================================================================
-# STAGED RSI ALERTS (core feature)
+# STAGED RSI ALERTS (core feature — now trend-aware)
 # ==============================================================================
 
 def generate_staged_alerts():
-    """3-stage RSI alert system based on 15M trigger + 5M confirmation."""
+    """3-stage RSI alert system based on 15M trigger + 5M confirmation.
+    Now uses adaptive thresholds and signal classification."""
     alerts = []
 
     for asset in ASSET_NAMES:
         cfg = ASSETS[asset]
         emoji = cfg["emoji"]
-        rsi_os = cfg["rsi_os"]
-        rsi_ob = cfg["rsi_ob"]
-        approach_os = rsi_os + RSI_APPROACH_BUFFER  # e.g. 35 for ETH
-        approach_ob = rsi_ob - RSI_APPROACH_BUFFER  # e.g. 65 for ETH
         priority = cfg["priority"]
 
+        # Get adaptive thresholds
+        long_5m, short_5m = get_rsi_thresholds(asset)
+        long_15m, short_15m = get_15m_thresholds(asset)
+
+        # Staged thresholds: 15M enters the zone, 5M confirms
+        # For 15M approach: use the 15M threshold
+        # For 15M trigger (extreme): use the 5M threshold applied to 15M
+        rsi_os_15m = long_15m  # approach zone for oversold
+        rsi_os_trigger = long_5m  # trigger threshold (more extreme)
+        rsi_ob_15m = short_15m  # approach zone for overbought
+        rsi_ob_trigger = short_5m  # trigger threshold (more extreme)
+
         state = staged_state.get(asset, "neutral")
+        ts = trend_state.get(asset, "NEUTRAL")
+        trend_label = get_trend_label(ts)
 
         # Get RSI values
         rsi_15m = _get_rsi(asset, "15m")
         rsi_5m = _get_rsi(asset, "5m")
         rsi_1h = _get_rsi(asset, "1h")
         price = _get_price(asset)
-        trend_4h = _get_4h_trend(asset)
         prev_5m = staged_5m_prev.get(asset)
 
         # Update 5M history
@@ -369,95 +1127,196 @@ def generate_staged_alerts():
         msg = None
 
         # === LONG SIDE ===
+        if long_5m is not None and rsi_os_15m is not None:
 
-        # Stage 1: approaching oversold (silent — skip to stage 2)
-        if state == "neutral" and approach_os >= rsi_15m > rsi_os:
-            new_state = "approach_long"
+            # Stage 1: approaching oversold
+            if state == "neutral" and rsi_os_15m >= rsi_15m > (rsi_os_trigger if rsi_os_trigger else 0):
+                new_state = "approach_long"
 
-        # Stage 2: 15M crosses below threshold
-        elif state in ("neutral", "approach_long") and rsi_15m <= rsi_os:
-            new_state = "triggered_long"
-            rsi_5m_str = f"{rsi_5m:.1f}" if rsi_5m else "N/A"
-            rsi_1h_str = f"{rsi_1h:.1f}" if rsi_1h else "N/A"
-            bonuses = get_confluence_bonus(asset, "long")
-            grade = "A" if len(bonuses) >= 2 else "B" if len(bonuses) == 1 else "C"
-            lines = [
-                f"\U0001f3af {emoji} {asset} OVERSOLD \u2014 Grade {grade}",
-                f"15M RSI: {rsi_15m:.1f}",
-                f"5M RSI: {rsi_5m_str} | 1H RSI: {rsi_1h_str}",
-                f"4H Trend: {trend_4h}",
-                f"${price:,.2f}",
-            ]
-            lines.extend(bonuses)
-            if grade != "C":
-                msg = "\n".join(lines)
-            else:
-                log.info(f"Suppressed Grade C: {asset} OVERSOLD 15M={rsi_15m:.1f}")
-
-        # Stage 3: 5M confirms (was oversold, now turning up)
-        elif state == "triggered_long" and rsi_5m is not None and prev_5m is not None:
-            if prev_5m < (rsi_os + RSI_APPROACH_BUFFER) and rsi_5m > prev_5m + 2:
-                new_state = "neutral"
+            # Stage 2: 15M crosses below threshold
+            elif state in ("neutral", "approach_long") and rsi_os_trigger is not None and rsi_15m <= rsi_os_trigger:
+                new_state = "triggered_long"
+                rsi_5m_str = f"{rsi_5m:.1f}" if rsi_5m else "N/A"
+                rsi_1h_str = f"{rsi_1h:.1f}" if rsi_1h else "N/A"
                 bonuses = get_confluence_bonus(asset, "long")
-                grade = "A" if len(bonuses) >= 2 else "B" if len(bonuses) == 1 else "C"
-                lines = [
-                    f"\U0001f7e2 {emoji} {asset} LONG CONFIRMED \u2014 Grade {grade}",
-                    f"5M RSI turned: {prev_5m:.0f}\u2192{rsi_5m:.0f}",
-                    f"15M RSI: {rsi_15m:.1f} | ${price:,.2f}",
-                ]
-                lines.extend(bonuses)
-                if grade != "C":
-                    msg = "\n".join(lines)
+                grade = compute_grade(bonuses)
+                if grade == "C" and rsi_5m is not None and rsi_5m <= RSI_DEEP_EXTREME_LOW:
+                    grade = "C*"
+                classification = classify_signal(asset, "long")
+                suppressed = should_suppress_signal(classification, grade)
+
+                if is_momentum_blocked(asset, "long"):
+                    log.info(f"Momentum blocked: {asset} LONG (RSI below 40 for {momentum_below.get(asset,0)} candles)")
+                elif grade == "C":
+                    log.info(f"Suppressed Grade C: {asset} OVERSOLD 15M={rsi_15m:.1f}")
                 else:
-                    log.info(f"Suppressed Grade C: {asset} LONG CONFIRMED 5M={rsi_5m:.1f}")
+                    should_fire, rep_count, rep_reason = check_repeat_signal(asset, "long", grade)
+                    if not should_fire:
+                        log.info(f"Repeat suppressed: {asset} LONG #{rep_count}: {rep_reason}")
+                    else:
+                        conf_str, _, _ = _build_tf_context(asset, "long")
+                        regime_tag = get_regime_str(asset)
+                        rep_str = f" ({rep_count}x)" if rep_count >= 2 else ""
+                        tag = f" {regime_tag}" if regime_tag else (" \u26a0\ufe0f CT" if classification == "COUNTER-TREND" else "")
+                        msg = f"\U0001f7e2 {emoji} {asset} LONG \u2014 Grade {grade}{tag}{rep_str}\n${price:,.2f}\n{_get_1h_rsi_trend_str(asset)} | {conf_str}"
+                        vol_ctx = _get_vol_context(asset)
+                        if vol_ctx:
+                            msg += f"\n{vol_ctx}"
+                        _register_active_signal(asset, "long", price, rsi_5m if rsi_5m else 0, grade)
+
+            # Stage 3: 5M confirms (was oversold, now turning up)
+            elif state == "triggered_long" and rsi_5m is not None and prev_5m is not None:
+                confirm_zone = (long_5m + RSI_APPROACH_BUFFER) if long_5m else 35
+                if prev_5m < confirm_zone and rsi_5m > prev_5m + 2:
+                    new_state = "neutral"
+                    bonuses = get_confluence_bonus(asset, "long")
+                    grade = compute_grade(bonuses)
+                    if grade == "C" and rsi_5m is not None and rsi_5m <= RSI_DEEP_EXTREME_LOW:
+                        grade = "C*"
+                    classification = classify_signal(asset, "long")
+                    suppressed = should_suppress_signal(classification, grade)
+
+                    vel_pts, vel_str = get_rsi_velocity(asset, "5m")
+
+                    if is_momentum_blocked(asset, "long"):
+                        log.info(f"Momentum blocked: {asset} LONG CONFIRMED")
+                    elif grade == "C":
+                        log.info(f"Suppressed Grade C: {asset} LONG CONFIRMED 5M={rsi_5m:.1f}")
+                    else:
+                        should_fire, rep_count, rep_reason = check_repeat_signal(asset, "long", grade)
+                        if not should_fire:
+                            log.info(f"Repeat suppressed: {asset} LONG CONFIRMED #{rep_count}: {rep_reason}")
+                        else:
+                            conf_str, _, _ = _build_tf_context(asset, "long")
+                            regime_tag = get_regime_str(asset)
+                            rep_str = f" ({rep_count}x)" if rep_count >= 2 else ""
+                            tag = f" {regime_tag}" if regime_tag else (" \u26a0\ufe0f CT" if classification == "COUNTER-TREND" else "")
+                            msg = f"\U0001f7e2 {emoji} {asset} LONG \u2014 Grade {grade}{tag}{rep_str}\n${price:,.2f}\n{_get_1h_rsi_trend_str(asset)} | {conf_str}"
+                            vol_ctx = _get_vol_context(asset)
+                            if vol_ctx:
+                                msg += f"\n{vol_ctx}"
+                            _register_active_signal(asset, "long", price, rsi_5m if rsi_5m else 0, grade)
 
         # === SHORT SIDE ===
+        if short_5m is not None and rsi_ob_15m is not None and msg is None:
 
-        # Stage 1: approaching overbought (silent — skip to stage 2)
-        elif state == "neutral" and approach_ob <= rsi_15m < rsi_ob:
-            new_state = "approach_short"
+            # Stage 1: approaching overbought
+            if state == "neutral" and rsi_ob_15m <= rsi_15m < (rsi_ob_trigger if rsi_ob_trigger else 100):
+                new_state = "approach_short"
 
-        # Stage 2: 15M crosses above threshold
-        elif state in ("neutral", "approach_short") and rsi_15m >= rsi_ob:
-            new_state = "triggered_short"
-            rsi_5m_str = f"{rsi_5m:.1f}" if rsi_5m else "N/A"
-            rsi_1h_str = f"{rsi_1h:.1f}" if rsi_1h else "N/A"
-            bonuses = get_confluence_bonus(asset, "short")
-            grade = "A" if len(bonuses) >= 2 else "B" if len(bonuses) == 1 else "C"
-            lines = [
-                f"\U0001f3af {emoji} {asset} OVERBOUGHT \u2014 Grade {grade}",
-                f"15M RSI: {rsi_15m:.1f}",
-                f"5M RSI: {rsi_5m_str} | 1H RSI: {rsi_1h_str}",
-                f"4H Trend: {trend_4h}",
-                f"${price:,.2f}",
-            ]
-            lines.extend(bonuses)
-            if grade != "C":
-                msg = "\n".join(lines)
-            else:
-                log.info(f"Suppressed Grade C: {asset} OVERBOUGHT 15M={rsi_15m:.1f}")
-
-        # Stage 3: 5M confirms (was overbought, now turning down)
-        elif state == "triggered_short" and rsi_5m is not None and prev_5m is not None:
-            if prev_5m > (rsi_ob - RSI_APPROACH_BUFFER) and rsi_5m < prev_5m - 2:
-                new_state = "neutral"
+            # Stage 2: 15M crosses above threshold
+            elif state in ("neutral", "approach_short") and rsi_ob_trigger is not None and rsi_15m >= rsi_ob_trigger:
+                new_state = "triggered_short"
+                rsi_5m_str = f"{rsi_5m:.1f}" if rsi_5m else "N/A"
+                rsi_1h_str = f"{rsi_1h:.1f}" if rsi_1h else "N/A"
                 bonuses = get_confluence_bonus(asset, "short")
-                grade = "A" if len(bonuses) >= 2 else "B" if len(bonuses) == 1 else "C"
-                lines = [
-                    f"\U0001f534 {emoji} {asset} SHORT CONFIRMED \u2014 Grade {grade}",
-                    f"5M RSI turned: {prev_5m:.0f}\u2192{rsi_5m:.0f}",
-                    f"15M RSI: {rsi_15m:.1f} | ${price:,.2f}",
-                ]
-                lines.extend(bonuses)
-                if grade != "C":
-                    msg = "\n".join(lines)
+                grade = compute_grade(bonuses)
+                if grade == "C" and rsi_5m is not None and rsi_5m >= RSI_DEEP_EXTREME_HIGH:
+                    grade = "C*"
+                classification = classify_signal(asset, "short")
+                suppressed = should_suppress_signal(classification, grade)
+
+                if is_momentum_blocked(asset, "short"):
+                    log.info(f"Momentum blocked: {asset} SHORT (RSI above 60 for {momentum_above.get(asset,0)} candles)")
+                elif grade == "C":
+                    log.info(f"Suppressed Grade C: {asset} OVERBOUGHT 15M={rsi_15m:.1f}")
                 else:
-                    log.info(f"Suppressed Grade C: {asset} SHORT CONFIRMED 5M={rsi_5m:.1f}")
+                    should_fire, rep_count, rep_reason = check_repeat_signal(asset, "short", grade)
+                    if not should_fire:
+                        log.info(f"Repeat suppressed: {asset} SHORT #{rep_count}: {rep_reason}")
+                    else:
+                        conf_str, _, _ = _build_tf_context(asset, "short")
+                        regime_tag = get_regime_str(asset)
+                        rep_str = f" ({rep_count}x)" if rep_count >= 2 else ""
+                        tag = f" {regime_tag}" if regime_tag else (" \u26a0\ufe0f CT" if classification == "COUNTER-TREND" else "")
+                        msg = f"\U0001f534 {emoji} {asset} SHORT \u2014 Grade {grade}{tag}{rep_str}\n${price:,.2f}\n{_get_1h_rsi_trend_str(asset)} | {conf_str}"
+                        vol_ctx = _get_vol_context(asset)
+                        if vol_ctx:
+                            msg += f"\n{vol_ctx}"
+                        _register_active_signal(asset, "short", price, rsi_5m if rsi_5m else 0, grade)
+
+            # Stage 3: 5M confirms (was overbought, now turning down)
+            elif state == "triggered_short" and rsi_5m is not None and prev_5m is not None:
+                confirm_zone = (short_5m - RSI_APPROACH_BUFFER) if short_5m else 65
+                if prev_5m > confirm_zone and rsi_5m < prev_5m - 2:
+                    new_state = "neutral"
+                    bonuses = get_confluence_bonus(asset, "short")
+                    grade = compute_grade(bonuses)
+                    if grade == "C" and rsi_5m is not None and rsi_5m >= RSI_DEEP_EXTREME_HIGH:
+                        grade = "C*"
+                    classification = classify_signal(asset, "short")
+                    suppressed = should_suppress_signal(classification, grade)
+
+                    vel_pts, vel_str = get_rsi_velocity(asset, "5m")
+
+                    if is_momentum_blocked(asset, "short"):
+                        log.info(f"Momentum blocked: {asset} SHORT CONFIRMED")
+                    elif grade == "C":
+                        log.info(f"Suppressed Grade C: {asset} SHORT CONFIRMED 5M={rsi_5m:.1f}")
+                    else:
+                        should_fire, rep_count, rep_reason = check_repeat_signal(asset, "short", grade)
+                        if not should_fire:
+                            log.info(f"Repeat suppressed: {asset} SHORT CONFIRMED #{rep_count}: {rep_reason}")
+                        else:
+                            conf_str, _, _ = _build_tf_context(asset, "short")
+                            regime_tag = get_regime_str(asset)
+                            rep_str = f" ({rep_count}x)" if rep_count >= 2 else ""
+                            tag = f" {regime_tag}" if regime_tag else (" \u26a0\ufe0f CT" if classification == "COUNTER-TREND" else "")
+                            msg = f"\U0001f534 {emoji} {asset} SHORT \u2014 Grade {grade}{tag}{rep_str}\n${price:,.2f}\n{_get_1h_rsi_trend_str(asset)} | {conf_str}"
+                            vol_ctx = _get_vol_context(asset)
+                            if vol_ctx:
+                                msg += f"\n{vol_ctx}"
+                            _register_active_signal(asset, "short", price, rsi_5m if rsi_5m else 0, grade)
+
+        # === v2.4: BOUNCE-FADE SHORT (only during WATERFALL_DOWN) ===
+        regime = market_regime.get(asset, "NORMAL")
+        if regime == "WATERFALL_DOWN" and rsi_5m is not None and msg is None:
+            bs = bounce_state.get(asset, "idle")
+            prev_low = bounce_rsi_low.get(asset, 100)
+
+            # Track lowest RSI seen
+            if rsi_5m < prev_low:
+                bounce_rsi_low[asset] = rsi_5m
+
+            if bs == "idle" and rsi_5m < 25:
+                bounce_state[asset] = "watching"
+                bounce_rsi_low[asset] = rsi_5m
+                log.info(f"Bounce-fade: {asset} watching (5M RSI {rsi_5m:.1f})")
+
+            elif bs == "watching" and rsi_5m >= BOUNCE_FADE_ENTRY:
+                bounce_state[asset] = "ready"
+                log.info(f"Bounce-fade: {asset} ready (5M RSI {rsi_5m:.1f}, low was {bounce_rsi_low.get(asset, 0):.1f})")
+
+            elif bs == "ready":
+                if prev_5m is not None and rsi_5m < prev_5m - BOUNCE_FADE_TURN:
+                    # 5M RSI turning down — fire short signal
+                    bounce_state[asset] = "idle"
+                    bounce_rsi_low[asset] = 100
+                    conf_str, _, _ = _build_tf_context(asset, "short")
+                    rsi_1h_val = _get_rsi(asset, "1h")
+                    rsi_1h_str = f"{rsi_1h_val:.0f}" if rsi_1h_val else "?"
+                    msg = f"\U0001f534 {emoji} {asset} SHORT \u2014 Bounce Fade\n${price:,.2f}\n1H RSI {rsi_1h_str} | {conf_str}"
+                    vol_ctx = _get_vol_context(asset)
+                    if vol_ctx:
+                        msg += f"\n{vol_ctx}"
+                    _register_active_signal(asset, "short", price, rsi_5m, "B")
+                    log.info(f"Bounce-fade SHORT fired: {asset} 5M RSI {rsi_5m:.1f} (was {bounce_rsi_low.get(asset, 0):.1f})")
+                elif rsi_5m > 55:
+                    # Bounce is real (RSI reclaiming), cancel fade
+                    bounce_state[asset] = "idle"
+                    bounce_rsi_low[asset] = 100
+                    log.info(f"Bounce-fade: {asset} cancelled — RSI reclaimed 55")
+
+            # Reset if regime clears
+        elif regime != "WATERFALL_DOWN":
+            if bounce_state.get(asset) != "idle":
+                bounce_state[asset] = "idle"
+                bounce_rsi_low[asset] = 100
 
         if new_state != state:
             staged_state[asset] = new_state
             r5 = f"{rsi_5m:.1f}" if rsi_5m else "N/A"
-            log.info(f"Staged: {asset} {state} -> {new_state} | 15M={rsi_15m:.1f} 5M={r5}")
+            log.info(f"Staged: {asset} {state} -> {new_state} | 15M={rsi_15m:.1f} 5M={r5} trend={ts}")
 
         if msg:
             alerts.append(msg)
@@ -466,47 +1325,97 @@ def generate_staged_alerts():
 
 
 # ==============================================================================
-# STANDALONE 5M RSI ALERTS (ETH only)
+# STANDALONE 5M RSI ALERTS (all assets, trend-aware + velocity)
 # ==============================================================================
 
-def generate_eth_5m_rsi_alerts():
-    """Fire alerts when ETH 5m RSI crosses 30 (oversold) or 70 (overbought)."""
-    global eth_5m_rsi_state, eth_5m_rsi_last_alert
+def generate_5m_rsi_alerts():
+    """Fire alerts when 5m RSI crosses adaptive thresholds.
+    Requires RSI velocity >= 15 pts in 3 candles."""
     alerts = []
 
-    rsi_5m = _get_rsi("ETH", "5m")
-    price = _get_price("ETH")
-    if rsi_5m is None or price is None:
-        return alerts
+    for asset in ASSET_NAMES:
+        rsi_5m = _get_rsi(asset, "5m")
+        price = _get_price(asset)
+        if rsi_5m is None or price is None:
+            continue
 
-    now = time.time()
-    emoji = ASSETS["ETH"]["emoji"]
+        # Update RSI history for velocity
+        update_rsi_history(asset, "5m", rsi_5m)
 
-    # Oversold: RSI crosses below 30
-    if rsi_5m <= ETH_5M_RSI_OS and eth_5m_rsi_state != "oversold":
-        if now - eth_5m_rsi_last_alert >= ETH_5M_RSI_COOLDOWN:
-            eth_5m_rsi_state = "oversold"
-            eth_5m_rsi_last_alert = now
-            alerts.append(
-                f"\U0001f7e2 {emoji} ETH 5m RSI OVERSOLD\n"
-                f"RSI: {rsi_5m:.1f} | ${price:,.2f}"
-            )
-            log.info(f"ETH 5m RSI oversold: {rsi_5m:.1f}")
+        emoji = ASSETS[asset]["emoji"]
+        now = time.time()
+        state = rsi_5m_state.get(asset, "neutral")
+        last_alert = rsi_5m_last_alert.get(asset, 0)
 
-    # Overbought: RSI crosses above 70
-    elif rsi_5m >= ETH_5M_RSI_OB and eth_5m_rsi_state != "overbought":
-        if now - eth_5m_rsi_last_alert >= ETH_5M_RSI_COOLDOWN:
-            eth_5m_rsi_state = "overbought"
-            eth_5m_rsi_last_alert = now
-            alerts.append(
-                f"\U0001f534 {emoji} ETH 5m RSI OVERBOUGHT\n"
-                f"RSI: {rsi_5m:.1f} | ${price:,.2f}"
-            )
-            log.info(f"ETH 5m RSI overbought: {rsi_5m:.1f}")
+        long_thresh, short_thresh = get_rsi_thresholds(asset)
+        ts = trend_state.get(asset, "NEUTRAL")
+        trend_label = get_trend_label(ts)
 
-    # Reset when RSI returns to neutral zone (40-60)
-    elif 40 < rsi_5m < 60:
-        eth_5m_rsi_state = "neutral"
+        vel_pts, vel_str = get_rsi_velocity(asset, "5m")
+
+        # Oversold: RSI crosses below long threshold
+        if long_thresh is not None and rsi_5m <= long_thresh and state != "oversold":
+            if now - last_alert >= RSI_5M_COOLDOWN:
+                if vel_pts >= RSI_VELOCITY_MIN or rsi_5m <= RSI_DEEP_EXTREME_LOW:
+                    classification = classify_signal(asset, "long")
+                    rsi_5m_state[asset] = "oversold"
+                    rsi_5m_last_alert[asset] = now
+
+                    if is_momentum_blocked(asset, "long"):
+                        log.info(f"Momentum blocked: {asset} 5M oversold alert")
+                    else:
+                        deep_tag = " (DEEP)" if rsi_5m <= RSI_DEEP_EXTREME_LOW else ""
+                        should_fire, rep_count, rep_reason = check_repeat_signal(asset, "long", "B")
+                        if not should_fire:
+                            log.info(f"Repeat suppressed: {asset} 5M oversold #{rep_count}: {rep_reason}")
+                        else:
+                            conf_str, _, _ = _build_tf_context(asset, "long")
+                            regime_tag = get_regime_str(asset)
+                            rep_str = f" ({rep_count}x)" if rep_count >= 2 else ""
+                            tag = f" {regime_tag}" if regime_tag else (" \u26a0\ufe0f CT" if classification == "COUNTER-TREND" else "")
+                            msg = f"\U0001f7e2 {emoji} {asset} LONG \u2014 Grade B{tag}{rep_str}\n${price:,.2f}\n{_get_1h_rsi_trend_str(asset)} | {conf_str}"
+                            vol_ctx = _get_vol_context(asset)
+                            if vol_ctx:
+                                msg += f"\n{vol_ctx}"
+                            _register_active_signal(asset, "long", price, rsi_5m if rsi_5m else 0, "B")
+                        log.info(f"{asset} 5m RSI oversold: {rsi_5m:.1f} vel={vel_pts:.0f}")
+                else:
+                    rsi_5m_state[asset] = "oversold"
+                    log.info(f"{asset} 5m RSI oversold but slow (vel={vel_pts:.0f} < {RSI_VELOCITY_MIN})")
+
+        # Overbought: RSI crosses above short threshold
+        elif short_thresh is not None and rsi_5m >= short_thresh and state != "overbought":
+            if now - last_alert >= RSI_5M_COOLDOWN:
+                if vel_pts >= RSI_VELOCITY_MIN or rsi_5m >= RSI_DEEP_EXTREME_HIGH:
+                    classification = classify_signal(asset, "short")
+                    rsi_5m_state[asset] = "overbought"
+                    rsi_5m_last_alert[asset] = now
+
+                    if is_momentum_blocked(asset, "short"):
+                        log.info(f"Momentum blocked: {asset} 5M overbought alert")
+                    else:
+                        deep_tag = " (DEEP)" if rsi_5m >= RSI_DEEP_EXTREME_HIGH else ""
+                        should_fire, rep_count, rep_reason = check_repeat_signal(asset, "short", "B")
+                        if not should_fire:
+                            log.info(f"Repeat suppressed: {asset} 5M overbought #{rep_count}: {rep_reason}")
+                        else:
+                            conf_str, _, _ = _build_tf_context(asset, "short")
+                            regime_tag = get_regime_str(asset)
+                            rep_str = f" ({rep_count}x)" if rep_count >= 2 else ""
+                            tag = f" {regime_tag}" if regime_tag else (" \u26a0\ufe0f CT" if classification == "COUNTER-TREND" else "")
+                            msg = f"\U0001f534 {emoji} {asset} SHORT \u2014 Grade B{tag}{rep_str}\n${price:,.2f}\n{_get_1h_rsi_trend_str(asset)} | {conf_str}"
+                            vol_ctx = _get_vol_context(asset)
+                            if vol_ctx:
+                                msg += f"\n{vol_ctx}"
+                            _register_active_signal(asset, "short", price, rsi_5m if rsi_5m else 0, "B")
+                        log.info(f"{asset} 5m RSI overbought: {rsi_5m:.1f} vel={vel_pts:.0f}")
+                else:
+                    rsi_5m_state[asset] = "overbought"
+                    log.info(f"{asset} 5m RSI overbought but slow (vel={vel_pts:.0f} < {RSI_VELOCITY_MIN})")
+
+        # Reset when RSI returns to neutral zone (40-60)
+        elif 40 < rsi_5m < 60:
+            rsi_5m_state[asset] = "neutral"
 
     return alerts
 
@@ -560,7 +1469,8 @@ def generate_other_alerts():
                 else:
                     alert_state[("ema_cross", tf, asset)] = new
 
-        # -- Divergence --------------------------------------------------------
+        # -- Divergence (with Cardwell reclassification) -----------------------
+        ts = trend_state.get(asset, "NEUTRAL")
         for tf in DIVERGENCE_TIMEFRAMES:
             candles = candle_cache.get((asset, tf))
             if not candles or len(candles) < 30:
@@ -572,7 +1482,26 @@ def generate_other_alerts():
             old = alert_state.get(("divergence", tf, asset))
             if old and old != new and new != "none":
                 desc = divs[-1][1]
-                if new == "bullish":
+
+                # Cardwell reclassification: divergence WITH the trend = continuation
+                # Bearish div in strong uptrend = price keeps making highs, RSI fading = normal, not reversal
+                # Bullish div in strong downtrend = price keeps making lows, RSI rising = normal, not reversal
+                cardwell_continuation = False
+                if new == "bearish" and ts in ("STRONG_UPTREND",):
+                    cardwell_continuation = True
+                    log.info(f"Cardwell: {asset} {tf} bearish div reclassified as continuation (strong uptrend)")
+                    msg = check_and_alert("divergence", tf, asset, new,
+                        f"{emoji} {asset} {tf} \u2014 RSI Divergence (Continuation)\n"
+                        f"{desc}\n"
+                        f"Cardwell: bearish div in strong uptrend = trend intact, not reversal")
+                elif new == "bullish" and ts in ("STRONG_DOWNTREND",):
+                    cardwell_continuation = True
+                    log.info(f"Cardwell: {asset} {tf} bullish div reclassified as continuation (strong downtrend)")
+                    msg = check_and_alert("divergence", tf, asset, new,
+                        f"{emoji} {asset} {tf} \u2014 RSI Divergence (Continuation)\n"
+                        f"{desc}\n"
+                        f"Cardwell: bullish div in strong downtrend = trend intact, not reversal")
+                elif new == "bullish":
                     msg = check_and_alert("divergence", tf, asset, new,
                         f"{emoji} {asset} {tf} \u2014 Bullish RSI Divergence\n"
                         f"{desc}")
@@ -580,43 +1509,14 @@ def generate_other_alerts():
                     msg = check_and_alert("divergence", tf, asset, new,
                         f"{emoji} {asset} {tf} \u2014 Bearish RSI Divergence\n"
                         f"{desc}")
+
                 if msg:
                     alerts.append(msg)
             else:
                 alert_state[("divergence", tf, asset)] = new
 
-        # -- Volume Spike ------------------------------------------------------
-        spike_thresh = ASSETS[asset].get("vol_spike", VOLUME_SPIKE_MULT)
-        for tf in VOLUME_TIMEFRAMES:
-            candles = candle_cache.get((asset, tf))
-            if not candles or len(candles) < 21:
-                continue
-            volumes = [c["volume"] for c in candles]
-            cur_vol = volumes[-1]
-            avg_vol = sum(volumes[-21:-1]) / 20
-            if avg_vol == 0:
-                continue
-            ratio = cur_vol / avg_vol
-            if ratio >= spike_thresh:
-                new = "spike"
-                c_last = candles[-1]
-                price = c_last["close"]
-                qvol = c_last.get("quote_volume", cur_vol * price)
-                if qvol >= 1_000_000:
-                    vol_str = f"${qvol / 1_000_000:.1f}M"
-                elif qvol >= 1_000:
-                    vol_str = f"${qvol / 1_000:.0f}K"
-                else:
-                    vol_str = f"${qvol:,.0f}"
-                direction = "Buy" if c_last["close"] >= c_last["open"] else "Sell"
-                msg = check_and_alert("volume", tf, asset, new,
-                    f"{emoji} {asset} {tf} \u2014 Volume Spike\n"
-                    f"{direction} | {vol_str} ({ratio:.1f}x avg)\n"
-                    f"${price:,.2f}")
-                if msg:
-                    alerts.append(msg)
-            else:
-                alert_state[("volume", tf, asset)] = "normal"
+        # -- Volume Spike -- DISABLED v2.3 (noise — already used as confluence bonus in entry signals)
+        pass
 
     return alerts
 
@@ -728,8 +1628,159 @@ def generate_swing_alerts():
 
 
 # ==============================================================================
+# CONTEXT ALERTS (proactive market info)
+# ==============================================================================
+
+def _ctx_can_fire(alert_type, asset, cooldown=CONTEXT_COOLDOWN_DEFAULT):
+    return time.time() - context_cooldowns.get((alert_type, asset), 0) >= cooldown
+
+def _ctx_fire(alert_type, asset):
+    context_cooldowns[(alert_type, asset)] = time.time()
+
+
+def generate_context_alerts():
+    """Proactive context alerts — keeps user informed even when trade signals are suppressed."""
+    alerts = []
+
+    # --- v2.4: Regime changes (fast waterfall detection) ---
+    while pending_regime_changes:
+        asset, old_r, new_r = pending_regime_changes.pop(0)
+        emoji = ASSETS[asset]["emoji"]
+        rsi_1h_val = _get_rsi(asset, "1h")
+        rsi_1h_str = f"{rsi_1h_val:.0f}" if rsi_1h_val else "?"
+        if new_r == "WATERFALL_DOWN":
+            msg = f"\u26a0\ufe0f {emoji} {asset} REGIME: WATERFALL DOWN\n1H RSI: {rsi_1h_str} | Shorts favored, longs risky"
+        elif new_r == "WATERFALL_UP":
+            msg = f"\u26a0\ufe0f {emoji} {asset} REGIME: MELT-UP\n1H RSI: {rsi_1h_str} | Longs favored, shorts risky"
+        else:
+            msg = f"\u2139\ufe0f {emoji} {asset} REGIME: Normal\nWaterfall cleared \u2014 standard signals resumed"
+        alerts.append(msg)
+        log.info(f"Regime alert: {asset} {old_r} -> {new_r}")
+
+    # --- 5a. Trend state changes (drain pending list) ---
+    while pending_trend_changes:
+        asset, old_ts, new_ts = pending_trend_changes.pop(0)
+        emoji = ASSETS[asset]["emoji"]
+        old_label = get_trend_label(old_ts)
+        new_label = get_trend_label(new_ts)
+
+        # Determine implication
+        trend_rank = {"STRONG_DOWNTREND": -2, "MILD_DOWNTREND": -1, "NEUTRAL": 0, "MILD_UPTREND": 1, "STRONG_UPTREND": 2}
+        old_r = trend_rank.get(old_ts, 0)
+        new_r = trend_rank.get(new_ts, 0)
+        if new_r > old_r:
+            impl = "Trend strengthening to upside"
+        elif new_r < old_r:
+            impl = "Trend weakening / shifting to downside"
+        else:
+            impl = "Trend shift"
+
+        # Show new thresholds
+        long_t, short_t = get_rsi_thresholds(asset)
+        lt_str = f"L<{long_t}" if long_t is not None else "L:OFF"
+        st_str = f"S>{short_t}" if short_t is not None else "S:OFF"
+
+        alerts.append(
+            f"\u2139\ufe0f {emoji} {asset} TREND SHIFT: {old_label} \u2192 {new_label}\n"
+            f"{impl}\n"
+            f"New thresholds: {lt_str} / {st_str}"
+        )
+
+    # Sections 1-8 DISABLED v2.3: these are noise.
+    # Entry signals already capture confluence (grade + TF count).
+    # Only trend shifts (above) are kept.
+
+    return alerts
+
+
+# ==============================================================================
 # TELEGRAM UI
 # ==============================================================================
+
+
+# ==============================================================================
+# v2.3: EXIT / HOLD SIGNALS (Multi-TF context while in trade)
+# ==============================================================================
+
+def _exit_can_fire(alert_type, asset):
+    return time.time() - exit_alert_cooldowns.get((alert_type, asset), 0) >= EXIT_SIGNAL_COOLDOWN
+
+def _exit_fire(alert_type, asset):
+    exit_alert_cooldowns[(alert_type, asset)] = time.time()
+
+def generate_exit_signals():
+    """Check active signals for exit/hold conditions based on 15M/30M RSI."""
+    alerts = []
+    now = time.time()
+    expired = []
+
+    for asset, sig in list(active_signals.items()):
+        emoji = ASSETS[asset]["emoji"]
+        direction = sig["direction"]
+        entry_time = sig["entry_time"]
+        elapsed = now - entry_time
+
+        rsi_5m = _get_rsi(asset, "5m")
+        rsi_15m = _get_rsi(asset, "15m")
+        rsi_30m = _get_rsi(asset, "30m")
+
+        # --- Expiry check ---
+        if elapsed > EXIT_SIGNAL_EXPIRY:
+            expired.append(asset)
+            continue
+        if rsi_5m is not None and EXIT_RSI_NEUTRAL_LOW <= rsi_5m <= EXIT_RSI_NEUTRAL_HIGH:
+            if elapsed > 120:  # 2 min grace period
+                expired.append(asset)
+                continue
+
+        dir_15m, delta_15m = get_rsi_direction(asset, "15m")
+        dir_30m, delta_30m = get_rsi_direction(asset, "30m")
+
+        r5 = f"{rsi_5m:.0f}" if rsi_5m else "--"
+        r15 = f"{rsi_15m:.1f}" if rsi_15m else "--"
+        r30 = f"{rsi_30m:.1f}" if rsi_30m else "--"
+
+        arrow_15 = "\u2191" if dir_15m == "up" else "\u2193" if dir_15m == "down" else "\u2192"
+        arrow_30 = "\u2191" if dir_30m == "up" else "\u2193" if dir_30m == "down" else "\u2192"
+
+        # --- (a) 15M RSI turning against ---
+        consec_against = _15m_consecutive_against(asset, direction)
+        if consec_against >= EXIT_15M_TURN_THRESHOLD and _exit_can_fire("15m_turn", asset):
+            _exit_fire("15m_turn", asset)
+            alerts.append(
+                f"\u26a0\ufe0f {emoji} {asset} \u2014 15M RSI turning against your {direction}\n"
+                f"15M RSI: {r15} ({arrow_15}{delta_15m:.0f}pts)\n"
+                f"5M: {r5} | 30M: {r30}\n"
+                f"Consider tightening stop or taking profit"
+            )
+
+        # --- (b) 30M RSI exhaustion (approaching neutral from extreme) ---
+        if rsi_30m is not None:
+            approaching_neutral = EXIT_30M_NEUTRAL_LOW <= rsi_30m <= EXIT_30M_NEUTRAL_HIGH
+            entry_30m = sig.get("entry_rsi_30m")
+            was_extreme = (
+                (direction == "long" and entry_30m is not None and entry_30m < 40) or
+                (direction == "short" and entry_30m is not None and entry_30m > 60)
+            )
+            if approaching_neutral and was_extreme and _exit_can_fire("30m_exhaust", asset):
+                _exit_fire("30m_exhaust", asset)
+                alerts.append(
+                    f"\U0001f3af {emoji} {asset} \u2014 30M RSI approaching neutral ({rsi_30m:.0f}{arrow_30})\n"
+                    f"Move may be exhausting. Lock in profits.\n"
+                    f"5M: {r5} | 15M: {r15}"
+                )
+
+        # --- (c) 15M supports hold --- DISABLED: bot can't know if user is in a trade
+
+        # --- (d) Time warnings --- DISABLED: bot can't know if user actually entered the trade
+
+    # Clean up expired signals
+    for asset in expired:
+        del active_signals[asset]
+        log.info(f"Active signal expired: {asset}")
+
+    return alerts
+
 
 def build_menu(selected_asset="ETH"):
     asset_buttons = []
@@ -745,14 +1796,16 @@ def build_menu(selected_asset="ETH"):
          InlineKeyboardButton("Bollinger", callback_data="bollinger")],
         [InlineKeyboardButton("Divergence", callback_data="divergence"),
          InlineKeyboardButton("Volume", callback_data="volume")],
-        [InlineKeyboardButton("Price", callback_data="price")],
+        [InlineKeyboardButton("Price", callback_data="price"),
+         InlineKeyboardButton("Trend", callback_data="trend")],
     ])
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*LighterRSI Signal Bot*\n\n"
-        "Staged RSI alerts for ETH/BTC/SOL on Lighter DEX.\n\n"
+        "*LighterRSI Signal Bot v2.4*\n\n"
+        "Trend-aware staged RSI alerts for ETH/BTC/SOL on Lighter DEX.\n"
+        "Funding rates | SOL-tuned thresholds | Cardwell divergence\n\n"
         "Choose an asset or indicator:",
         parse_mode="Markdown",
         reply_markup=build_menu(),
@@ -761,6 +1814,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await refresh_candles()
+    update_all_trend_states()
     text = format_status()
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=build_menu())
 
@@ -774,8 +1828,8 @@ def _get_selected_assets(asset_filter):
 
 
 def format_status():
-    """Compact 3-asset dashboard."""
-    lines = []
+    """Compact 3-asset dashboard with trend info."""
+    lines = ["*Dashboard*\n"]
     for asset in ASSET_NAMES:
         cfg = ASSETS[asset]
         emoji = cfg["emoji"]
@@ -784,10 +1838,12 @@ def format_status():
         rsi_5m = _get_rsi(asset, "5m")
         rsi_15m = _get_rsi(asset, "15m")
         rsi_1h = _get_rsi(asset, "1h")
-        trend_4h = _get_4h_trend(asset)
+        ts = trend_state.get(asset, "NEUTRAL")
 
+        rsi_30m = _get_rsi(asset, "30m")
         r5 = f"{rsi_5m:.0f}" if rsi_5m else "--"
         r15 = f"{rsi_15m:.0f}" if rsi_15m else "--"
+        r30 = f"{rsi_30m:.0f}" if rsi_30m else "--"
         r1h = f"{rsi_1h:.0f}" if rsi_1h else "--"
 
         state = staged_state.get(asset, "neutral")
@@ -795,7 +1851,98 @@ def format_status():
         if state != "neutral":
             state_str = f" | {state.replace('_', ' ').upper()}"
 
-        lines.append(f"{emoji} {asset}: {price_str} | 5M: {r5} | 15M: {r15} | 1H: {r1h} | 4H: {trend_4h}{state_str}")
+        trend_emoji = {
+            "STRONG_UPTREND": "\u2b06\ufe0f\u2b06\ufe0f",
+            "MILD_UPTREND": "\u2b06\ufe0f",
+            "NEUTRAL": "\u27a1\ufe0f",
+            "MILD_DOWNTREND": "\u2b07\ufe0f",
+            "STRONG_DOWNTREND": "\u2b07\ufe0f\u2b07\ufe0f",
+        }
+        te = trend_emoji.get(ts, "")
+
+        lines.append(f"{emoji} {asset}: {price_str} | 5M:{r5} 15M:{r15} 30M:{r30} 1H:{r1h} | {te} {get_trend_label(ts)}{state_str}")
+
+        # Show active signal if any
+        if asset in active_signals:
+            asig = active_signals[asset]
+            el = int(time.time() - asig["entry_time"])
+            lines.append(f"  Active: {asig['direction'].upper()} ({el//60}m{el%60:02d}s)")
+
+        # Show adaptive thresholds
+        long_t, short_t = get_rsi_thresholds(asset)
+        long_str = f"L<{long_t}" if long_t is not None else "L:OFF"
+        short_str = f"S>{short_t}" if short_t is not None else "S:OFF"
+        mom_a = momentum_above.get(asset, 0)
+        mom_b = momentum_below.get(asset, 0)
+        mom_str = ""
+        if mom_a >= 5:
+            mom_str = f" | Mom:{mom_a}\u2191"
+        elif mom_b >= 5:
+            mom_str = f" | Mom:{mom_b}\u2193"
+        lines.append(f"  Thresholds: {long_str} / {short_str}{mom_str}")
+
+    return "\n".join(lines)
+
+
+def format_trend(asset_filter=None):
+    """Detailed trend status for each asset."""
+    assets = _get_selected_assets(asset_filter)
+    lines = ["*Trend Status*\n"]
+    for asset in assets:
+        emoji = ASSETS[asset]["emoji"]
+        ts = trend_state.get(asset, "NEUTRAL")
+        price = _get_price(asset)
+        ema_4h = _get_4h_ema50(asset)
+        rsi_1h = _get_rsi(asset, "1h")
+        rsi_5m = _get_rsi(asset, "5m")
+
+        trend_emoji = {
+            "STRONG_UPTREND": "\u2b06\ufe0f\u2b06\ufe0f",
+            "MILD_UPTREND": "\u2b06\ufe0f",
+            "NEUTRAL": "\u27a1\ufe0f",
+            "MILD_DOWNTREND": "\u2b07\ufe0f",
+            "STRONG_DOWNTREND": "\u2b07\ufe0f\u2b07\ufe0f",
+        }
+        te = trend_emoji.get(ts, "")
+
+        lines.append(f"\n{emoji} *{asset}* {te} {get_trend_label(ts)}")
+
+        if price and ema_4h:
+            dist = (price - ema_4h) / ema_4h * 100
+            lines.append(f"  Price: ${price:,.2f} | 4H EMA50: ${ema_4h:,.2f} ({dist:+.1f}%)")
+        if rsi_1h is not None:
+            lines.append(f"  1H RSI: {rsi_1h:.1f}")
+
+        long_t, short_t = get_rsi_thresholds(asset)
+        long_str = f"RSI < {long_t}" if long_t is not None else "SUPPRESSED"
+        short_str = f"RSI > {short_t}" if short_t is not None else "SUPPRESSED"
+        lines.append(f"  Long entry: {long_str}")
+        lines.append(f"  Short entry: {short_str}")
+
+        # Momentum persistence
+        mom_a = momentum_above.get(asset, 0)
+        mom_b = momentum_below.get(asset, 0)
+        if mom_a > 0:
+            lines.append(f"  Momentum: {mom_a} candles RSI>60" + (" \u26a0\ufe0f BLOCKING" if mom_a >= MOMENTUM_PERSISTENCE_THRESHOLD else ""))
+        elif mom_b > 0:
+            lines.append(f"  Momentum: {mom_b} candles RSI<40" + (" \u26a0\ufe0f BLOCKING" if mom_b >= MOMENTUM_PERSISTENCE_THRESHOLD else ""))
+        else:
+            lines.append(f"  Momentum: neutral")
+
+        # RSI velocity
+        vel_pts, vel_str = get_rsi_velocity(asset, "5m")
+        if vel_pts > 0:
+            lines.append(f"  5M Velocity: {vel_str}")
+
+        # Funding rate
+        rate = get_funding_rate(asset)
+        if rate is not None:
+            funding_dir, funding_desc = get_funding_signal(asset)
+            if funding_dir:
+                lines.append(f"  {funding_desc}")
+            else:
+                lines.append(f"  Funding: {rate*100:+.4f}% (neutral)")
+
     return "\n".join(lines)
 
 
@@ -981,6 +2128,7 @@ BUTTON_HANDLERS = {
     "divergence": format_divergence,
     "volume": format_volume,
     "price": format_price,
+    "trend": format_trend,
 }
 
 
@@ -997,6 +2145,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_selected_asset[chat_id] = sel
         selected = user_selected_asset.get(chat_id, ASSET_NAMES[0])
         await refresh_candles()
+        update_all_trend_states()
         text = format_rsi(selected)
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=build_menu(selected))
         return
@@ -1005,6 +2154,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     handler = BUTTON_HANDLERS.get(data)
     if handler:
         await refresh_candles()
+        update_all_trend_states()
         text = handler(asset_filter)
     else:
         text = "Unknown command"
@@ -1051,11 +2201,49 @@ async def polling_task(app):
         try:
             await refresh_candles()
 
+            # Fetch funding rates (cached, only hits Binance every 5 min)
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, fetch_funding_rates)
+            except Exception as e:
+                log.warning(f"Funding rate update failed: {e}")
+
+            # Fetch Binance volume data (cached, refreshes every 60s)
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, fetch_binance_volume)
+            except Exception as e:
+                log.warning(f"Binance volume update failed: {e}")
+
+            # Update trend state every cycle
+            update_all_trend_states()
+
+            # Update market regime (fast overlay — detects waterfalls)
+            update_all_regimes()
+
+            # Update RSI history for velocity tracking
+            for asset in ASSET_NAMES:
+                rsi_5m = _get_rsi(asset, "5m")
+                update_rsi_history(asset, "5m", rsi_5m)
+                # v2.3: track 15m/30m RSI direction + 1D for signal context
+                update_rsi_direction_history(asset, "15m")
+                update_rsi_direction_history(asset, "30m")
+                # Track 1D RSI in main rsi_history for direction arrow
+                rsi_1d = _get_rsi(asset, "1d")
+                update_rsi_history(asset, "1d", rsi_1d)
+
             alerts = []
-            alerts.extend(generate_eth_5m_rsi_alerts())
+
+            # Momentum persistence warnings
+            for asset in ASSET_NAMES:
+                warning = update_momentum_persistence(asset)
+                if warning:
+                    alerts.append(warning)
+
+            alerts.extend(generate_5m_rsi_alerts())
             alerts.extend(generate_staged_alerts())
-            alerts.extend(generate_other_alerts())
-            alerts.extend(generate_swing_alerts())
+            # generate_other_alerts: per-TF RSI/EMA/divergence/volume — DISABLED (noise)
+            # generate_swing_alerts: multi-indicator confluence on 1H/4H — DISABLED (noise)
+            alerts.extend(generate_context_alerts())  # trend shifts only
+            alerts.extend(generate_exit_signals())
 
             for msg in alerts:
                 try:
@@ -1093,19 +2281,81 @@ async def post_init(app):
             counts.append(f"{tf}={len(c)}" if c else f"{tf}=0")
         log.info(f"  {asset}: {', '.join(counts)}")
 
-    # Initialize staged state
+    # v2.3: Initialize direction tracking and exit state
+    active_signals.clear()
+    signal_history.clear()
+    exit_alert_cooldowns.clear()
+    for asset in ASSET_NAMES:
+        rsi_history_15m[asset] = deque(maxlen=8)
+        rsi_history_30m[asset] = deque(maxlen=8)
+        rsi_15m_val = _get_rsi(asset, "15m")
+        rsi_30m_val = _get_rsi(asset, "30m")
+        if rsi_15m_val is not None:
+            rsi_history_15m[asset].append(rsi_15m_val)
+        if rsi_30m_val is not None:
+            rsi_history_30m[asset].append(rsi_30m_val)
+
+    # Initialize staged state and trend
     for asset in ASSET_NAMES:
         staged_state[asset] = "neutral"
         rsi_5m = _get_rsi(asset, "5m")
         if rsi_5m is not None:
             staged_5m_prev[asset] = rsi_5m
+            update_rsi_history(asset, "5m", rsi_5m)
+        rsi_5m_state[asset] = "neutral"
+        rsi_5m_last_alert[asset] = 0
+        momentum_above[asset] = 0
+        momentum_below[asset] = 0
+        momentum_warned[asset] = None
+        # Context alert init
+        context_flags[("approach_long", asset)] = False
+        context_flags[("approach_short", asset)] = False
+        context_flags[("exhaustion_ob", asset)] = False
+        context_flags[("exhaustion_os", asset)] = False
+        context_flags[("ema_pullback", asset)] = False
+        context_flags[("bb_squeeze", asset)] = False
+        context_flags[("mtf_extreme", asset)] = None
+        context_flags[("rsi_1h_prev", asset)] = _get_rsi(asset, "1h")
+        for tf in ["1h", "4h"]:
+            context_flags[("div_context", asset, tf)] = None
+
+    update_all_trend_states()
+
+    # Bootstrap funding rates
+    try:
+        fetch_funding_rates()
+        fetch_binance_volume()
+
+        # Bootstrap regime detection
+        for asset in ASSET_NAMES:
+            market_regime[asset] = detect_market_regime(asset)
+            bounce_state[asset] = "idle"
+            bounce_rsi_low[asset] = 100
+            log.info(f"  {asset}: regime={market_regime[asset]}")
+        for asset in ASSET_NAMES:
+            rate = get_funding_rate(asset)
+            rate_str = f"{rate*100:+.4f}%" if rate is not None else "N/A"
+            log.info(f"  {asset}: funding={rate_str}")
+    except Exception as e:
+        log.warning(f"Funding rate bootstrap failed: {e}")
+
+    for asset in ASSET_NAMES:
+        ts = trend_state.get(asset, "NEUTRAL")
+        long_t, short_t = get_rsi_thresholds(asset)
+        log.info(f"  {asset}: trend={ts} long_thresh={long_t} short_thresh={short_t}")
+
+    # Pre-seed alert states to suppress bootstrap alerts
+    generate_other_alerts()   # sets divergence/ema/volume states without sending
+    generate_swing_alerts()   # sets swing states without sending
+    generate_context_alerts() # sets context flags without sending
+    log.info("Bootstrap alert states seeded (no alerts sent)")
 
     asyncio.create_task(polling_task(app))
     log.info("Background polling task launched")
 
 
 def main():
-    log.info("Starting LighterRSI Signal Bot...")
+    log.info("Starting LighterRSI Signal Bot v2.4 (regime+volume+format)...")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
